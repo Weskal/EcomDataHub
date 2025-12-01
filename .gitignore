@@ -3,3 +3,10 @@ config/env_config
 .venv
 __pycache__
 src/notebooks/
+data/
+logs/
+plugins/
+.DS_Store
+.vscode/
+.env
+__init__.py
