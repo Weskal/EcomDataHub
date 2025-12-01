@@ -1,5 +1,6 @@
 import requests
 import os
+from datetime import datetime
 import logging
 import json
 import pandas as pd
@@ -9,6 +10,8 @@ from datetime import datetime as dt
 from datetime import timedelta
 import subprocess
 import time
+import io
+from utils.minio_connection import connect_minio
 
 def extract_data():
     response = requests.get('https://fakestoreapi.com/products')
@@ -89,17 +92,12 @@ def generate_fake_data(products_list, data_folder):
 
 def meta_data(df, file_name, elapsed_time, status, data_folder):
     
-    def get_last_commit_hash():
-        result = subprocess.check_output(["git", "rev-parse", "HEAD"]).decode().strip()
-        return result
-    
     try:
         output_path = os.path.join(data_folder, "raw", file_name + "_meta.json")
         profile_id = 1
         df_row_count = len(df)
         price_currency = "BRL"
         source_name = "Fake Store API"
-        commit_hash = get_last_commit_hash()
         automation_status = status
         environment = "dev"
         duration = elapsed_time
@@ -110,7 +108,6 @@ def meta_data(df, file_name, elapsed_time, status, data_folder):
         "row_count": df_row_count,
         "price_currency": price_currency,
         "source_name": source_name,
-        "commit_hash": commit_hash,
         "automation_status": automation_status,
         "environment": environment,
         "duration_seconds": duration,
@@ -165,10 +162,54 @@ def prepare_data(df, file_name, data_folder):
     # Saída Silver
     return df
 
+def send_to_minio(data, client, target_bucket, file_format="csv"):
+    """
+    Envia dados para o MinIO em formato CSV ou JSON
+    
+    Args:
+        data: DataFrame (para csv) ou dict/list (para json)
+        client: Cliente MinIO
+        target_bucket: Nome do bucket
+        file_format: "csv" ou "json"
+    """
+    
+    if file_format == "csv":
+        file_name = "orders_" + data["created_at"].unique()[0]
+        
+        csv_buffer = io.StringIO()
+        data.to_csv(csv_buffer, index=False)
+        content_bytes = csv_buffer.getvalue().encode("utf-8")
+        extension = ".csv"
+        
+    elif file_format == "json":
+        # Se for DataFrame, converte para dict
+        if hasattr(data, 'to_dict'):
+            json_data = data.to_dict(orient='records')
+            file_name = "orders_" + data["created_at"].unique()[0]
+        else:
+            json_data = data
+            file_name = "orders_" + str(datetime.now().strftime("%d-%m-%Y - %H:%M:%S")) +"_meta"
+        
+        content_bytes = json.dumps(json_data, indent=2, ensure_ascii=False).encode("utf-8")
+        extension = ".json"
+    
+    else:
+        raise ValueError("file_format deve ser 'csv' ou 'json'")
+    
+    byte_stream = io.BytesIO(content_bytes)
+    
+    client.put_object(
+        target_bucket,
+        f"{file_name}{extension}", 
+        byte_stream,
+        len(content_bytes)     
+    )
+    
 def run_pipeline(data_folder):
     
     start = time.perf_counter()
-    random.seed(50)
+    #random.seed(50)
+    client = connect_minio()
     status = "FAILED"
     
     df_products = None
@@ -181,8 +222,11 @@ def run_pipeline(data_folder):
             raise ValueError("A API não retornou produtos; abortando pipeline.")
 
         df_products, file_name = generate_fake_data(products_list, data_folder)
-
-        prepare_data(df_products, file_name, data_folder)
+        
+        # Sending CSV
+        send_to_minio(df_products, client, "bronze-layer", file_format="csv")
+        
+        #prepare_data(df_products, file_name, data_folder)
 
         status = "SUCCESS"
 
@@ -195,3 +239,6 @@ def run_pipeline(data_folder):
         end = time.perf_counter()
         elapsed_time = end - start
         meta_data(df_products, file_name, elapsed_time, status, data_folder)
+        meta = meta_data(df_products, file_name, elapsed_time, status, data_folder)
+        
+        send_to_minio(meta, client, "bronze-layer", file_format="json")
